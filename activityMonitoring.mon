@@ -1,0 +1,138 @@
+/** This monitor is responsible for running the trained ML Model with the activity data of your phone  */
+using com.apama.correlator.Component;
+using com.apama.cumulocity.Alarm;
+using com.apama.cumulocity.CumulocityRequestInterface;
+using com.apama.cumulocity.Measurement;
+using com.apama.cumulocity.MeasurementValue;
+using com.apama.cumulocity.FindAlarm;
+using com.apama.cumulocity.FindAlarmResponse;
+using com.apama.cumulocity.FindAlarmResponseAck;
+using com.apama.cumulocity.FindManagedObjectResponse;
+using com.apama.cumulocity.FindManagedObjectResponseAck;
+using com.apama.cumulocity.FindManagedObject;
+using com.apama.cumulocity.ManagedObject;
+using com.softwareag.connectivity.httpclient.HttpOptions;
+using com.softwareag.connectivity.httpclient.HttpTransport;
+using com.softwareag.connectivity.httpclient.Request;
+using com.softwareag.connectivity.httpclient.Response;
+using com.apama.json.JSONPlugin;
+
+monitor activityMonitoring {
+    // Model to be used for recognizing activities
+    string modelName := "activityModel3";
+
+	CumulocityRequestInterface cumulocity;
+
+    action onload() {
+    	log "Loading monitor activityMonitoring" at INFO;
+    	cumulocity := CumulocityRequestInterface.connectToCumulocity();
+        listenAndActOnMeasurements();        
+    }
+
+    action listenAndActOnMeasurements() {
+        //TODO: Start one monitor per device?
+        monitor.subscribe(Measurement.SUBSCRIBE_CHANNEL);
+        monitor.subscribe(FindAlarmResponse.SUBSCRIBE_CHANNEL);
+        monitor.subscribe(FindManagedObjectResponse.SUBSCRIBE_CHANNEL);
+        
+        on all Measurement(type="c8y_Acceleration") as m {   
+        	log "Received Measurement from C8Y from device: " + m.source at INFO;
+            //Gather the data
+            string record := convertMeasurementToRecord(m);
+            Request zementisRequest := cumulocity.createRequest("GET", "/service/zementis/apply/"+modelName, any());
+		    zementisRequest.setQueryParameter("record", record);
+		    zementisRequest.execute(ModelHandler(m.source).requestHandler);		    
+        }
+    }
+
+    action convertMeasurementToRecord(Measurement m) returns string
+    {
+        dictionary<string, any> json := {};
+       	json["c8y_Acceleration_accelerationX"] := m.measurements.getOrDefault("c8y_Acceleration").getOrDefault("accelerationX").value;
+    	json["c8y_Acceleration_accelerationY"] := m.measurements.getOrDefault("c8y_Acceleration").getOrDefault("accelerationY").value;
+    	json["c8y_Acceleration_accelerationZ"] := m.measurements.getOrDefault("c8y_Acceleration").getOrDefault("accelerationZ").value;
+        return JSONPlugin.toJSON(json);
+    }
+
+    event ModelHandler
+    {
+        string deviceId;
+        constant string ALARM_TYPE := "ActivityRecognitionAlarm";
+        constant integer thresholdValueForDeterminingActivity := 5;
+        action requestHandler(Response apiResponse) {  	
+        	integer statusCode := apiResponse.statusCode;        	   
+        	// Starting checking the outputs for 200 responses.
+        	//Maybe add a counter here to ignore first 5 responses
+        	if(statusCode = 200) {
+        		string currentActivity := apiResponse.payload.getSequence("outputs")[0].getEntry("predicted_label").valueToString();
+        		sendProbabilities(apiResponse, deviceId);
+        		updateActivity(currentActivity);
+				}
+	    	}        	      
+    
+        action sendProbabilities(com.softwareag.connectivity.httpclient.Response response, string deviceId) {
+        	string probability_holding:= response.payload.getSequence("outputs")[0].getEntry("probability_holding").valueToString();
+        	string probability_waving:= response.payload.getSequence("outputs")[0].getEntry("probability_waving").valueToString();
+        	string probability_flipping:= response.payload.getSequence("outputs")[0].getEntry("probability_flipping").valueToString();
+        	string probability_idle:= response.payload.getSequence("outputs")[0].getEntry("probability_idle").valueToString();
+            //Send probabilites as measurements to cumulocity
+        	send Measurement ("" ,"c8y_ActivityProbability", deviceId, currentTime, 
+        	{"c8y_ActivityProbability":
+        	{"probability_holding" :MeasurementValue(probability_holding.toFloat(), "", new dictionary<string,any>),
+        		"probability_waving" :MeasurementValue(probability_waving.toFloat(), "", new dictionary<string,any>),
+        		"probability_flipping" :MeasurementValue(probability_flipping.toFloat(), "", new dictionary<string,any>),
+        		"probability_idle" :MeasurementValue(probability_idle.toFloat(), "", new dictionary<string,any>)
+    			}}, new dictionary<string,any>) to Measurement.SEND_CHANNEL;
+    	}
+    
+        action updateActivity(string currentActivity) {
+        	//Get managed object of device
+    		integer reqId := com.apama.cumulocity.Util.generateReqId();
+        	send FindManagedObject(reqId, deviceId, {"fragmentType": "c8y_IsDevice"}) to FindManagedObject.SEND_CHANNEL;
+        	on FindManagedObjectResponse(reqId=reqId) as response and not FindManagedObjectResponseAck(reqId=reqId) 
+        	{
+        		ManagedObject mo := response.managedObject;
+        		integer counter := <integer>mo.params.getOrAdd("activity_counter",0);
+        		string lastActivity := <string>mo.params.getOrAdd("activity_last","idle");
+        		string referenceActivity := <string>mo.params.getOrAdd("activity_reference","idle");
+        		//log "Last activity is: " + lastActivity + " Current Activity is: " + currentActivity;
+        		if currentActivity =  referenceActivity {
+        			counter := counter + 1;
+        		} else {
+        			mo.params["activity_reference"] := currentActivity;
+        			counter := 1;
+        		}
+        		mo.params["activity_counter"] := counter;
+        		//Create alarm if threashold is reached.       		
+        		if counter = thresholdValueForDeterminingActivity and lastActivity != referenceActivity {
+        			string alarmMessage := "User switched activity from '" + lastActivity + "' to '" + currentActivity + "'.";
+					clearOldAlarmAndSendNewAlarm(alarmMessage);
+					mo.params["activity_last"] := currentActivity;
+        		}
+                //Update managedobject in cumulocity
+        		send mo to ManagedObject.UPDATE_CHANNEL;
+        	}
+        }        
+        
+    	action clearOldAlarmAndSendNewAlarm(string alarmMessage) {
+    		integer reqId:= integer.getUnique();
+    		send FindAlarm(reqId, {"source": deviceId, "status": "ACTIVE", "type": ALARM_TYPE}) to FindAlarm.SEND_CHANNEL;
+    		//clear old alarm if existing
+    		on FindAlarmResponse(reqId=reqId) as alarmResponse and not FindAlarmResponseAck(reqId=reqId) {
+    			send Alarm(alarmResponse.id, ALARM_TYPE, deviceId, currentTime, alarmResponse.alarm.text,
+    			           "CLEARED", alarmResponse.alarm.severity, 1, new dictionary<string, any>) to Alarm.SEND_CHANNEL;
+    			log "Old Alarm cleared: " + alarmResponse.alarm.text;
+    		}    		
+    		//create new alarm for current activity
+    		on FindAlarmResponseAck(reqId=reqId) {
+    			createNewAlarm(alarmMessage);
+    		}
+    	}
+    	
+        action createNewAlarm(string alarmMessage) {
+        	send Alarm("", ALARM_TYPE, deviceId, currentTime,
+        	           alarmMessage, "ACTIVE", "CRITICAL", 1, new dictionary<string,any>) to Alarm.SEND_CHANNEL;
+        	log "Alarm added as - "+alarmMessage;
+        } 
+    }
+}
