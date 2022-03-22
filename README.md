@@ -1,4 +1,4 @@
-# Cumulocity phone activity recogntion
+# Cumulocity phone activity recognition
 Simple example of how machine learning models can be run in cumulocity. For a more detailed description, take a look at the [Cumulocity Guide](https://cumulocity.com/guides/machine-learning/activity-recognition/).
 
 Cumulocity is an IoT platform that enables rapid connections of many, many different devices and applications. It allows you to monitor and respond to IoT data in real time and to spin up this capability in minutes. More information on Cumulocity IoT and how to start a free trial can be found [here](https://www.softwareag.cloud/site/product/cumulocity-iot.html#/).
